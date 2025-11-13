@@ -1,0 +1,1 @@
+ "c:\windows\System32\OpenSSH\ssh.exe" -fN -l root -L 3306:localhost:3306 87.106.224.198
