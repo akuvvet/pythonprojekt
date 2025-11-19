@@ -1,18 +1,63 @@
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for, session
 import os
 from mieten import fuehre_mietabgleich_durch
 import traceback
+from datetime import timedelta, datetime
 
 UPLOAD_FOLDER = "uploads"
 RESULTS_FOLDER = "results"
+ADMIN_EMAIL = "akuvvet@gmail.com"
+ADMIN_PASSWORD = "AKuvvet"
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["RESULTS_FOLDER"] = RESULTS_FOLDER
+app.secret_key = os.environ.get("SECRET_KEY", "please-change-me-very-secret")
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=60)
 
 # Upload-Verzeichnis erzeugen
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULTS_FOLDER, exist_ok=True)
+
+
+# --- Auth Schutz global ---
+@app.before_request
+def require_login():
+    open_endpoints = {"login", "static"}
+    if request.endpoint in open_endpoints or request.endpoint is None:
+        return
+    if not session.get("user_email"):
+        return redirect(url_for("login"))
+    # Session-Timeout (60 Minuten Inaktivität)
+    last = session.get("last_activity")
+    now_ts = int(datetime.utcnow().timestamp())
+    if last and (now_ts - int(last)) > 60 * 60:
+        session.clear()
+        return redirect(url_for("login"))
+    session["last_activity"] = now_ts
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "")
+        if email.lower() == ADMIN_EMAIL.lower() and password == ADMIN_PASSWORD:
+            session["user_email"] = email
+            session.permanent = True
+            session["last_activity"] = int(datetime.utcnow().timestamp())
+            return redirect(url_for("index"))
+        return render_template("login.html", error="Zugangsdaten ungültig.")
+    # GET
+    if session.get("user_email"):
+        return redirect(url_for("index"))
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.route("/")
