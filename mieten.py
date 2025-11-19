@@ -1,31 +1,28 @@
 import pandas as pd
-import tkinter as tk
-from tkinter import filedialog
 from openpyxl import load_workbook
-from openpyxl.utils import column_index_from_string
-from openpyxl.comments import Comment # Import für Kommentarfunktion
+from openpyxl.comments import Comment
+from openpyxl.cell.cell import MergedCell
 import os
 import re
+from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
+from datetime import datetime
 
-# --- Konfiguration der Spalten und Monatszuordnung ---
-
-# Basisspalten für Miete (Betrag) und Datum in Mieter.xlsx (Buchstaben der Spalten)
 MONATS_ZUORDNUNG = {
-    "Jan": ["D", "E"],
-    "Feb": ["F", "G"],
-    "Mrz": ["H", "I"],
-    "Apr": ["J", "K"],
-    "Mai": ["L", "M"],
-    "Jun": ["N", "O"],
-    "Jul": ["P", "Q"],
-    "Aug": ["R", "S"],
-    "Sep": ["T", "U"],
-    "Okt": ["V", "W"],
-    "Nov": ["X", "Y"],
-    "Dez": ["Z", "AA"],
+    # Hinweis: Wegen neuer Spalte "Objekt" zwischen B und C sind alle Zielspalten +1 verschoben
+    "Jan": ["E", "F"],
+    "Feb": ["G", "H"],
+    "Mrz": ["I", "J"],
+    "Apr": ["K", "L"],
+    "Mai": ["M", "N"],
+    "Jun": ["O", "P"],
+    "Jul": ["Q", "R"],
+    "Aug": ["S", "T"],
+    "Sep": ["U", "V"],
+    "Okt": ["W", "X"],
+    "Nov": ["Y", "Z"],
+    "Dez": ["AA", "AB"],
 }
 
-# Deutsche Monatsnamen für die Suche im Verwendungszweck (Regex)
 MONATS_NAMENS_MAPPING = {
     "Januar": "Jan", "Jan": "Jan",
     "Februar": "Feb", "Feb": "Feb",
@@ -41,227 +38,493 @@ MONATS_NAMENS_MAPPING = {
     "Dezember": "Dez", "Dez": "Dez",
 }
 
-# Excel-Blattname und Spalten
-BLATTNAME = "haeselerstr"
-MIETER_SPALTE_LETTER = "A" # Eigentümer/Mieter
+BLATTNAME = "mieter"
+MIETER_SPALTE = "A"
 
-# CSV Spaltennamen
-CSV_DATUM_SPALTE = "Buchungstag"
-CSV_VERWENDUNGSZWECK_SPALTE = "Verwendungszweck"
-CSV_ABSENDER_SPALTE = "Beguenstigter/Zahlungspflichtiger"
-CSV_BETRAG_SPALTE = "Betrag"
-
-
-def fuehre_mietabgleich_durch(excel_pfad, csv_pfad):
+# Kontoauszug (XLSX) erwartete Spalten
+KONTO_DATUM = "Wertstellung"
+KONTO_PAYEE = "Empfänger/Auftraggeber"
+KONTO_VWZ = "Verwendungszweck"
+KONTO_KATEGORIE = "Kategorie"
+KONTO_OBJEKT = "Kontoname (Objekt)"
+KONTO_BETRAG = "Betrag"
 
 
+def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
 
-def fuehre_mietabgleich_durch():
-    """Hauptfunktion zur Durchführung des Mietabgleichs."""
-    print("--- 🏠 Starte Mietabgleich (Akkumulation/Kommentar-Logik aktiv) ---")
-    
-    # 1. Dateipfade abfragen
-    excel_pfad = waehle_datei("Wählen Sie die Mieter.xlsx Datei", "excel")
-    if not excel_pfad: return
+    # Excel (Mieterliste) einlesen
+    workbook = load_workbook(excel_pfad)
+    if BLATTNAME in workbook.sheetnames:
+        try:
+            worksheet = workbook[BLATTNAME]
+        except Exception:
+            return None
+        sheet_arg = BLATTNAME
+    else:
+        # Fallback: erstes Blatt
+        first_sheet = workbook.sheetnames[0]
+        worksheet = workbook[first_sheet]
+        sheet_arg = first_sheet
 
-    csv_pfad = waehle_datei("Wählen Sie die Kontoauszug CSV Datei", "csv")
-    if not csv_pfad: return
+    # Mieterliste laden
+    df_mieter = pd.read_excel(excel_pfad, sheet_name=sheet_arg, dtype=str)
+    df_mieter = df_mieter.fillna("")
+    mieter_col_name = df_mieter.columns[0]  # Spalte A: Eigentümer/Mieter
+    mieter_b_col_name = df_mieter.columns[1] if len(df_mieter.columns) > 1 else None  # Spalte B: Mieter
+    objekt_col_name = df_mieter.columns[2] if len(df_mieter.columns) > 2 else None     # Spalte C: Objekt
 
-    print(f"\nExcel-Datei: {os.path.basename(excel_pfad)}")
-    print(f"CSV-Datei: {os.path.basename(csv_pfad)}\n")
-
-    # 2. Excel-Datei mit openpyxl und pandas einlesen
+    # Erzeuge ein Index-Mapping von Namen (Spalte A) -> Zeilennummer im Zielblatt,
+    # damit Einträge immer in die korrekte Zeile geschrieben werden – unabhängig von Einfügungen.
+    mieter_row_map = {}
     try:
-        # Lade die Arbeitsmappe mit openpyxl für das Schreiben (behält Formatierung)
-        workbook = load_workbook(excel_pfad)
-        if BLATTNAME not in workbook.sheetnames:
-            print(f"FEHLER: Das Blatt '{BLATTNAME}' wurde in der Excel-Datei nicht gefunden.")
-            return
-            
-        worksheet = workbook[BLATTNAME]
-        
-        # Lese die Excel-Daten mit Pandas für die Mietersuche (Header in Zeile 1)
-        df_mieter = pd.read_excel(excel_pfad, sheet_name=BLATTNAME, header=0, na_filter=False)
-        mieter_col_name = df_mieter.columns[column_index_from_string(MIETER_SPALTE_LETTER) - 1]
-        
-        print(f"Mieter-Datei ({BLATTNAME}) erfolgreich eingelesen.")
-    except Exception as e:
-        print(f"FEHLER beim Lesen/Laden der Excel-Datei: {e}")
-        return
+        for r in range(1, worksheet.max_row + 1):
+            cell_val = worksheet[f"{MIETER_SPALTE}{r}"].value
+            if cell_val is None:
+                continue
+            key = str(cell_val)
+            # gleiche Normalisierung wie beim Matching
+            key = re.sub(r"[^a-z0-9\s]", " ", key.lower())
+            key = key.replace("ä","ae").replace("ö","oe").replace("ü","ue").replace("ß","ss")
+            key = re.sub(r"\s+", " ", key).strip()
+            if key and key not in mieter_row_map:
+                mieter_row_map[key] = r
+    except Exception:
+        pass
 
-    # 3. CSV-Kontoauszug einlesen (robuster Block)
-    df_konto = None
-    separators = [';', ',', '\t']
-    encodings = ['iso-8859-1', 'utf-8', 'latin-1'] 
-    
-    for sep in separators:
-        if df_konto is not None: break
-        for enc in encodings:
+    # Kontoauszug (XLSX) einlesen
+    try:
+        df_konto = pd.read_excel(konto_xlsx_pfad, dtype=str)
+    except Exception:
+        return None
+
+    df_konto = df_konto.fillna("")
+
+    # Fallback für den Fall, dass keine Header vorhanden sind (A-F)
+    if not all(col in df_konto.columns for col in [KONTO_DATUM, KONTO_PAYEE, KONTO_VWZ, KONTO_KATEGORIE, KONTO_OBJEKT, KONTO_BETRAG]):
+        if len(df_konto.columns) >= 6:
+            cols = list(df_konto.columns[:6])
+            mapping = {
+                cols[0]: KONTO_DATUM,
+                cols[1]: KONTO_PAYEE,
+                cols[2]: KONTO_VWZ,
+                cols[3]: KONTO_KATEGORIE,
+                cols[4]: KONTO_OBJEKT,
+                cols[5]: KONTO_BETRAG,
+            }
+            df_konto = df_konto.rename(columns=mapping)
+
+    # Typ-Konvertierungen (robust für EU-Formate wie 640,80 und Tausenderpunkte)
+    df_konto["__betrag_raw"] = df_konto[KONTO_BETRAG].astype(str)
+
+    def _parse_amount_raw(raw: str):
+        s = (str(raw) or "").strip()
+        if not s:
+            return pd.NA
+        s = s.replace("€", "").replace("\xa0", "").replace(" ", "")
+        # Wenn Komma vorhanden → als Dezimaltrenner behandeln, Punkte als Tausender entfernen
+        if "," in s:
+            s2 = s.replace(".", "").replace(",", ".")
             try:
-                temp_df = pd.read_csv(csv_pfad, sep=sep, encoding=enc, na_filter=False)
-                required_cols = [CSV_BETRAG_SPALTE, CSV_DATUM_SPALTE, CSV_ABSENDER_SPALTE, CSV_VERWENDUNGSZWECK_SPALTE]
-                if all(col in temp_df.columns for col in required_cols):
-                    df_konto = temp_df
-                    print(f"Kontoauszug erfolgreich eingelesen (Separator: '{sep}', Kodierung: '{enc}').")
-                    break 
+                return float(s2)
+            except Exception:
+                pass
+        # Sonst direkten Float-Versuch (z. B. 640.80)
+        try:
+            return float(s)
+        except Exception:
+            # Letzter Fallback: Muster <ganzzahl><,|.><1-2 Dezimalstellen>
+            m = re.search(r"(\d+)[,\.](\d{1,2})$", s)
+            if m:
+                try:
+                    return float(m.group(1) + "." + m.group(2))
+                except Exception:
+                    pass
+        return pd.NA
+
+    df_konto[KONTO_BETRAG] = df_konto["__betrag_raw"].apply(_parse_amount_raw)
+
+    # Datumsformat sauber parsen und Rohwert behalten
+    s = df_konto[KONTO_DATUM]
+    if is_datetime64_any_dtype(s):
+        df_konto["__raw_date"] = s.dt.strftime("%d.%m.%Y")
+    elif is_numeric_dtype(s):
+        dt = pd.to_datetime(s, unit="d", origin="1899-12-30", errors="coerce")
+        df_konto["__raw_date"] = dt.dt.strftime("%d.%m.%Y")
+        df_konto[KONTO_DATUM] = dt
+    else:
+        s2 = (
+            s.astype(str)
+             .str.strip()
+             .str.replace(r"\s+", "", regex=True)
+             .str.replace("/", ".", regex=False)
+        )
+        df_konto["__raw_date"] = s2
+        df_konto[KONTO_DATUM] = pd.to_datetime(s2, format="%d.%m.%Y", errors="coerce")
+
+    # Zahlungsgrund klassifizieren (Miete > Nebenkosten > Nachzahlung > Rate > Honorar)
+    def klassifiziere(text: str) -> str:
+        t = (text or "").lower()
+        # Robustere Erkennung inkl. Synonyme/Abkürzungen; Reihenfolge = Priorität
+        patterns = [
+            ("Miete", [
+                r"\bmiet\w*\b",  # deckt miete, mieten, mietzahlung, mietzins, mieter, etc. ab
+                r"\bkm\b", r"\bkaltmiete\b",
+                r"\bstellplatz\b", r"\bgarage\b"
+            ]),
+            ("Nebenkosten", [
+                r"\bnebenkosten\b", r"\bnk\b", r"\bbetriebskosten\b", r"\bbk\b"
+            ]),
+            ("Nachzahlung", [
+                r"\bnach\-?zahlung\b", r"\bnachz\b"
+            ]),
+            ("Rate", [
+                r"\brate(nzahlung)?\b"
+            ]),
+            ("Honorar", [
+                r"\bhonorar\b"
+            ]),
+        ]
+        for label, pats in patterns:
+            for p in pats:
+                if re.search(p, t, re.IGNORECASE):
+                    return label
+        return "Sonstiges"
+
+    df_konto["__text_summe"] = (
+        df_konto[KONTO_VWZ].astype(str) + " " +
+        df_konto[KONTO_KATEGORIE].astype(str) + " " +
+        df_konto[KONTO_OBJEKT].astype(str)
+    )
+    df_konto["__klass"] = df_konto["__text_summe"].apply(klassifiziere)
+
+    # Trefferwort (erstes passendes Suchwort) für spätere Auswertung
+    def finde_suchwort(text: str) -> str:
+        t = (text or "").lower()
+        patterns = [
+            ("Miete", [
+                r"\bmiet\w*\b", r"\bkm\b", r"\bkaltmiete\b",
+                r"\bstellplatz\b", r"\bgarage\b"
+            ]),
+            ("Nebenkosten", [
+                r"\bnebenkosten\b", r"\bnk\b", r"\bbetriebskosten\b", r"\bbk\b"
+            ]),
+            ("Nachzahlung", [
+                r"\bnach\-?zahlung\b", r"\bnachz\b"
+            ]),
+            ("Rate", [
+                r"\brate(nzahlung)?\b"
+            ]),
+            ("Honorar", [
+                r"\bhonorar\b"
+            ]),
+        ]
+        for _, pats in patterns:
+            for p in pats:
+                m = re.search(p, t, re.IGNORECASE)
+                if m:
+                    return m.group(0)
+        return ""
+
+    df_konto["__hit"] = df_konto["__text_summe"].apply(finde_suchwort)
+
+    # Sonderfall: Wenn Zahlender eine Behörde ist (Jobcenter/Agentur/Stadt Wuppertal),
+    # soll im Blatt "suchtreffer" in der Spalte "Suchwort" der komplette Verwendungszweck stehen.
+    def _normalize_simple(val: str) -> str:
+        t = (str(val) or "").lower()
+        t = t.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        t = re.sub(r"[^a-z0-9\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    payee_norm = df_konto[KONTO_PAYEE].astype(str).apply(_normalize_simple)
+    gov_mask = (
+        payee_norm.str.contains(r"\bjobcenter\b", regex=True)
+        | payee_norm.str.contains(r"\bbundesagentur\b", regex=True)
+        | payee_norm.str.contains(r"\bstadt\s*wuppertal\b", regex=True)
+    )
+    # hit_final: bei Behörden kompletter Verwendungszweck, sonst ermitteltes Suchwort (oder Klasse als Fallback)
+    df_konto["__hit_final"] = df_konto[KONTO_VWZ].astype(str)
+    df_konto.loc[~gov_mask, "__hit_final"] = df_konto["__hit"]
+    df_konto["__hit_final"] = df_konto["__hit_final"].where(df_konto["__hit_final"] != "", df_konto["__klass"])
+
+    # Neues Blatt mit Suchtreffern erstellen: A Datum, B Name, C Suchwort, D Betrag
+    sheet_such = "suchtreffer"
+    if sheet_such in workbook.sheetnames:
+        del workbook[sheet_such]
+    ws_such = workbook.create_sheet(sheet_such)
+    ws_such.append(["Datum", "Name", "Suchwort", "Betrag"])
+
+    relevante_labels = {"Miete", "Nebenkosten", "Nachzahlung", "Rate", "Honorar"}
+    # Alle Einzelbuchungen ohne Aggregation; stabil sortieren für nachvollziehbare Reihenfolge
+    df_such = df_konto[df_konto["__klass"].isin(relevante_labels)].copy()
+    try:
+        df_such = df_such.sort_values([KONTO_PAYEE, KONTO_DATUM, KONTO_BETRAG], kind="mergesort")
+    except Exception:
+        pass
+
+    for _, r in df_such.iterrows():
+        hit = r["__hit_final"]
+        ws_such.append(["", r[KONTO_PAYEE], str(hit), r[KONTO_BETRAG]])
+        row_idx = ws_such.max_row
+        # Datum korrekt schreiben (immer als echtes Datum DD.MM.YYYY; bei Fehler leer lassen)
+        date_cell = ws_such.cell(row=row_idx, column=1)
+        raw_val = r.get("__raw_date", "")
+        dval = r[KONTO_DATUM]
+        try:
+            if pd.notna(dval):
+                py_dt = dval.to_pydatetime() if hasattr(dval, "to_pydatetime") else dval
+                date_cell.value = py_dt.date()
+                date_cell.number_format = "DD.MM.YYYY"
+            else:
+                rv = (str(raw_val) or "").strip()
+                # ISO-ähnlich: 2025-06-02...
+                m_iso = re.search(r"(\d{4})[-/\.](\d{2})[-/\.](\d{2})", rv)
+                if m_iso:
+                    parsed = datetime(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+                    date_cell.value = parsed.date()
+                    date_cell.number_format = "DD.MM.YYYY"
+                else:
+                    rv2 = rv.replace("/", ".")
+                    parsed = datetime.strptime(rv2, "%d.%m.%Y")
+                    date_cell.value = parsed.date()
+                    date_cell.number_format = "DD.MM.YYYY"
+        except Exception:
+            date_cell.value = None
+            date_cell.number_format = "DD.MM.YYYY"
+        # Betrag formatieren
+        try:
+            ws_such.cell(row=row_idx, column=4).number_format = "#,##0.00"
+        except Exception:
+            pass
+
+    def _normalize_text(val: str) -> str:
+        t = (str(val) or "").lower()
+        t = t.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+        t = re.sub(r"[^a-z0-9\s]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    df_konto["__norm_payee"] = df_konto[KONTO_PAYEE].astype(str).apply(_normalize_text)
+    df_konto["__norm_kombi"] = (
+        df_konto[KONTO_PAYEE].astype(str) + " " +
+        df_konto[KONTO_VWZ].astype(str) + " " +
+        df_konto[KONTO_OBJEKT].astype(str)
+    ).apply(_normalize_text)
+    df_konto["__norm_vwz"] = df_konto[KONTO_VWZ].astype(str).apply(_normalize_text)
+    df_konto["__norm_objekt"] = df_konto[KONTO_OBJEKT].astype(str).apply(_normalize_text)
+    # Für Behörden-Fall: Suchwort (Verwendungszweck) normalisiert
+    try:
+        df_such["__norm_hit"] = df_such["__hit_final"].astype(str).apply(_normalize_text)
+    except Exception:
+        pass
+
+    # Eintragen aus Blatt "suchtreffer" in Monats-Spalten (E–AB) je Mieter (Spalte A)
+    months_order = list(MONATS_ZUORDNUNG.keys())
+
+    # Helfer
+    def _get_writable_cell(ws, coord):
+        c = ws[coord]
+        if isinstance(c, MergedCell):
+            for r in ws.merged_cells.ranges:
+                if coord in r:
+                    return ws.cell(row=r.min_row, column=r.min_col)
+        return c
+
+    def _write_date(cell, dt_val, raw_val) -> str:
+        # Schreibe IMMER als echtes Datum (DD.MM.YYYY); bei Fehler leer
+        if pd.notna(dt_val):
+            try:
+                py_dt = dt_val.to_pydatetime() if hasattr(dt_val, "to_pydatetime") else dt_val
+                cell.value = py_dt.date()
+                cell.number_format = "DD.MM.YYYY"
+                return py_dt.strftime("%d.%m.%Y")
+            except Exception:
+                pass
+        rv = (str(raw_val) or "").strip()
+        # ISO-ähnlich: 2025-06-02...
+        m_iso = re.search(r"(\d{4})[-/\.](\d{2})[-/\.](\d{2})", rv)
+        try:
+            if m_iso:
+                parsed = datetime(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3)))
+            else:
+                parsed = datetime.strptime(rv.replace("/", "."), "%d.%m.%Y")
+            cell.value = parsed.date()
+            cell.number_format = "DD.MM.YYYY"
+            return parsed.strftime("%d.%m.%Y")
+        except Exception:
+            cell.value = None
+            cell.number_format = "DD.MM.YYYY"
+            return ""
+
+    def _parse_amount_cell(val) -> float:
+        if val is None:
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        s = str(val).replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+
+    def _norm_ddmmyyyy(s: str) -> str:
+        s = (s or "").strip()
+        m = re.match(r"^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?$", s)
+        if not m:
+            return s
+        d = int(m.group(1)); mth = int(m.group(2)); yr = m.group(3)
+        if yr is None:
+            return f"{d:02d}.{mth:02d}"
+        return f"{d:02d}.{mth:02d}.{int(yr):04d}"
+
+    def _parse_pairs(txt: str):
+        pairs = []
+        seen = set()
+        if not txt:
+            return pairs
+        for line in txt.splitlines():
+            m = re.search(r"(\d{1,2}\.\d{1,2}(?:\.\d{2,4})?)\s*(?:\[(.*?)\])?\s*:\s*([+-]?\d+(?:[.,]\d+)?)", line)
+            if not m:
+                continue
+            d = _norm_ddmmyyyy(m.group(1))
+            try:
+                amt = round(float(m.group(3).replace(".", "").replace(",", ".")), 2)
             except Exception:
                 continue
-                
-    if df_konto is None:
-        print(f"FEHLER: Die CSV-Datei konnte nicht gelesen oder die benötigten Spalten nicht gefunden werden.")
-        return
-
-    # --- Datenbereinigung und -vorbereitung der CSV ---
-    try:
-        df_konto[CSV_BETRAG_SPALTE] = df_konto[CSV_BETRAG_SPALTE].astype(str).str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-        df_konto[CSV_BETRAG_SPALTE] = pd.to_numeric(df_konto[CSV_BETRAG_SPALTE], errors='coerce')
-        df_konto[CSV_DATUM_SPALTE] = pd.to_datetime(df_konto[CSV_DATUM_SPALTE], format='%d.%m.%Y', errors='coerce')
-    except Exception as e:
-        print(f"FEHLER bei der Konvertierung von Betrag/Datum in der CSV: {e}")
-        return
-
-    # 4. Abgleich und Eintragung
-    eintraege_gefunden = 0
-    monat_suchmuster = "|".join(re.escape(m) for m in MONATS_NAMENS_MAPPING.keys())
-
-    for index, mieter_reihe in df_mieter.iterrows():
-        excel_row_num = index + 2 # Zeilennummer in Excel (Header=1 -> Daten ab Zeile 2)
-        mieter_name = mieter_reihe[mieter_col_name]
-        
-        if not mieter_name:
-            continue
-
-        gefilterte_buchungen = df_konto[
-            (df_konto[CSV_ABSENDER_SPALTE].astype(str).str.contains(str(mieter_name), case=False, regex=True)) & 
-            (df_konto[CSV_VERWENDUNGSZWECK_SPALTE].astype(str).str.contains('Miete', case=False, regex=True))
-        ]
-
-        if gefilterte_buchungen.empty:
-            continue
-            
-        print(f"\n-> Verarbeite Mieter: **{mieter_name}** (Zeile {excel_row_num})")
-            
-        for _, buchung in gefilterte_buchungen.iterrows():
-            buchungs_datum = buchung[CSV_DATUM_SPALTE]
-            betrag = buchung[CSV_BETRAG_SPALTE]
-            verwendungszweck = buchung[CSV_VERWENDUNGSZWECK_SPALTE]
-            
-            if pd.isna(buchungs_datum) or pd.isna(betrag):
+            key = (d, amt)
+            if key in seen:
                 continue
-            
-            # --- 4.1. Bestimme den Zielmonat nach Priorität ---
-            
-            ziel_monat_kuerzel = None
-            
-            # 1. Priorität: Expliziter Monatsname im Verwendungszweck?
-            match = re.search(monat_suchmuster, verwendungszweck, re.IGNORECASE)
-            
-            if match:
-                gefundener_monat = match.group(0)
-                ziel_monat_kuerzel = MONATS_NAMENS_MAPPING.get(gefundener_monat.capitalize(), None)
-                if ziel_monat_kuerzel:
-                     print(f"   Monatsname '{gefundener_monat}' im VWZ gefunden. Priorität: **{ziel_monat_kuerzel}**.")
-            
-            # 2. Priorität: Datumsverschiebe-Logik, WENN kein expliziter Monat gefunden wurde
-            if ziel_monat_kuerzel is None:
-                if buchungs_datum.day > 25:
-                    naechster_monat_datum = buchungs_datum + pd.DateOffset(months=1)
-                    monat_nr_final = naechster_monat_datum.month
-                    ziel_monat_kuerzel = list(MONATS_ZUORDNUNG.keys())[monat_nr_final - 1]
-                    print(f"   Kein Monatsname gefunden. Buchungstag {buchungs_datum.day}. > 25. Buche in den **nächsten Monat ({ziel_monat_kuerzel})**.")
-                else:
-                    monat_nr_final = buchungs_datum.month
-                    ziel_monat_kuerzel = list(MONATS_ZUORDNUNG.keys())[monat_nr_final - 1]
-                    print(f"   Kein Monatsname gefunden. Buchungstag {buchungs_datum.day}. <= 25. Buche in den Monat der Buchung: **{ziel_monat_kuerzel}**.")
+            seen.add(key)
+            pairs.append((d, amt, m.group(1), (m.group(2) or "").strip()))
+        return pairs
 
-            # --- 4.2. Eintragung mit openpyxl (mit Prüf- und Akkumulationslogik) ---
-            
-            ziel_betrag_spalte_letter = MONATS_ZUORDNUNG[ziel_monat_kuerzel][0]
-            ziel_datum_spalte_letter = MONATS_ZUORDNUNG[ziel_monat_kuerzel][1]
-            
-            betrag_cell_ref = f"{ziel_betrag_spalte_letter}{excel_row_num}"
-            datum_cell_ref = f"{ziel_datum_spalte_letter}{excel_row_num}"
+    # Normname in Trefferliste
+    df_such["__norm_payee"] = df_such[KONTO_PAYEE].astype(str).apply(_normalize_text)
 
-            # Lese bestehende Werte aus Excel
-            existing_betrag = worksheet[betrag_cell_ref].value
-            existing_datum_cell = worksheet[datum_cell_ref]
-            existing_datum = existing_datum_cell.value
-            
-            # Neue Werte formatieren
-            new_betrag_val = betrag # float
-            new_datum_str = buchungs_datum.strftime('%d.%m.')
-            new_betrag_str_anzeige = f"{new_betrag_val:.2f}".replace('.', ',')
+    for _, row in df_mieter.iterrows():
+        m_name = row[mieter_col_name]
+        if not m_name:
+            continue
+        excel_row = mieter_row_map.get(_normalize_text(m_name))
+        if not excel_row:
+            continue
 
-            # Vorbereitung für den Datumsvergleich (bestehendes Datum in String-Format)
-            # Konvertiere Datum/datetime-Objekte in String TT.MM.
-            existing_datum_str = ""
-            if existing_datum:
-                if isinstance(existing_datum, pd.Timestamp): # Openpyxl kann Pandas/Datetime-Objekte zurückgeben
-                    existing_datum_str = existing_datum.strftime('%d.%m.')
-                else:
-                    existing_datum_str = str(existing_datum).strip()
-            
-            # Float-Vergleich mit Toleranz (Toleranz: 0.01 EUR)
-            is_same_amount = existing_betrag is not None and abs(existing_betrag - new_betrag_val) < 0.01
-            
-            if existing_betrag is None or existing_betrag == "":
-                # Fall 1: Zelle ist leer -> Normales Eintragen
-                worksheet[betrag_cell_ref] = new_betrag_val
-                worksheet[datum_cell_ref] = new_datum_str
-                worksheet[datum_cell_ref].comment = None 
-                print(f"   Eintrag für Monat **{ziel_monat_kuerzel}** NEU eingetragen: {new_betrag_str_anzeige} EUR am {new_datum_str}")
-                eintraege_gefunden += 1
+        # Behördenfall: Wenn Spalte A "jobcenter"/"agentur"/"stadt wuppertal" enthält,
+        # suche in suchtreffer den Namen aus Spalte B (Mieter) als Substring in Name (Spalte B).
+        owner_norm = _normalize_text(m_name)
+        tenant_norm = _normalize_text(row[mieter_b_col_name]) if mieter_b_col_name else ""
+        GOV_KEYS = ("jobcenter", "agentur", "stadt wuppertal")
+        if any(k in owner_norm for k in GOV_KEYS) and tenant_norm:
+            # Suche den Mieternamen (Spalte B aus "mieter") im Suchwort/Verwendungszweck (Spalte C in "suchtreffer")
+            treffer = df_such[df_such.get("__norm_hit", df_such["__norm_payee"]).str.contains(tenant_norm, na=False)]
+        else:
+            treffer = df_such[df_such["__norm_payee"] == owner_norm]
+        if treffer.empty:
+            continue
 
-            elif is_same_amount and existing_datum_str == new_datum_str:
-                # Fall 2: Exaktes Duplikat -> Ignorieren
-                print(f"   Eintrag für Monat **{ziel_monat_kuerzel}** ist ein Exakt-Duplikat (Betrag/Datum). **Ignoriert.**")
+        for _, t in treffer.iterrows():
+            dval = t[KONTO_DATUM]
+            raw_date = t.get("__raw_date", "")
+            kw = t["__hit"] if t["__hit"] else t["__klass"]
+            betrag = t[KONTO_BETRAG]
+            if pd.isna(betrag):
+                continue
 
+            # Monat robust bestimmen (Timestamp | ISO `YYYY-MM-DD...` | `DD.MM.YYYY`)
+            month_idx = None
+            if pd.notna(dval):
+                try:
+                    month_idx = int(getattr(dval, "month"))
+                except Exception:
+                    month_idx = None
+            if month_idx is None:
+                rv = str(raw_date or "").strip()
+                # ISO-ähnlich: 2025-06-02... → 06
+                m_iso = re.search(r"(\d{4})[-/\.](\d{2})[-/\.](\d{2})", rv)
+                if m_iso:
+                    try:
+                        month_idx = int(m_iso.group(2))
+                    except Exception:
+                        month_idx = None
+                if month_idx is None:
+                    try:
+                        month_idx = datetime.strptime(rv, "%d.%m.%Y").month
+                    except Exception:
+                        month_idx = None
+            if month_idx is None:
+                continue
+            month_idx = month_idx - 1
+            if month_idx < 0 or month_idx > 11:
+                continue
+            ziel = months_order[month_idx]
+            betrag_sp, datum_sp = MONATS_ZUORDNUNG[ziel]
+            betrag_cell = f"{betrag_sp}{excel_row}"
+            datum_cell = f"{datum_sp}{excel_row}"
+
+            date_cell = _get_writable_cell(worksheet, datum_cell)
+            prev_cell_val = date_cell.value
+            existing_amount = _parse_amount_cell(worksheet[betrag_cell].value)
+            existing_pairs = _parse_pairs(date_cell.comment.text if date_cell.comment else "")
+            existing_keys = {(d, a) for (d, a, _, __) in existing_pairs}
+
+            # neuer Schlüssel (Datum+Betrag) – Datum robust formatiert
+            if pd.notna(dval):
+                try:
+                    new_date_str = dval.strftime("%d.%m.%Y")
+                except Exception:
+                    new_date_str = ""
             else:
-                # Fall 3: Zelle gefüllt, aber es ist keine exakte Kopie -> Akkumulation erforderlich
-                
-                # 1. Neuen Gesamtbetrag berechnen
-                new_total_betrag = existing_betrag + new_betrag_val
-                new_total_betrag_anzeige = f"{new_total_betrag:.2f}".replace('.', ',')
-
-                # 2. Kommentar-Vorbereitung (inkl. aller Details)
-                current_comment_text = existing_datum_cell.comment.text if existing_datum_cell.comment else None
-
-                if current_comment_text:
-                    # Wenn bereits ein Kommentar existiert (d.h. es wurde schon einmal akkumuliert)
-                    comment_text = current_comment_text + f"\n+ {new_datum_str}: {new_betrag_str_anzeige} EUR"
+                rv = str(raw_date or "").strip()
+                m_iso = re.search(r"(\d{4})[-/\.](\d{2})[-/\.](\d{2})", rv)
+                if m_iso:
+                    try:
+                        new_date_str = datetime(int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))).strftime("%d.%m.%Y")
+                    except Exception:
+                        new_date_str = rv
                 else:
-                    # Wenn kein Kommentar existiert, erstelle einen neuen, der die bestehende Zahlung und die neue enthält
-                    existing_betrag_anzeige = f"{existing_betrag:.2f}".replace('.', ',')
-                    
-                    comment_text = f"Urspr.: {existing_datum_str}: {existing_betrag_anzeige} EUR"
-                    comment_text += f"\n+ Neu: {new_datum_str}: {new_betrag_str_anzeige} EUR"
-                    
-                # 3. Zelle aktualisieren (Gesamtbetrag und aktuellstes Datum)
-                worksheet[betrag_cell_ref] = new_total_betrag # Speichere den akkumulierten Betrag als Zahl
-                worksheet[datum_cell_ref] = new_datum_str 
-                
-                # 4. Kommentar zur Datum-Zelle hinzufügen
-                comment = Comment(comment_text, "Automatisches Update")
-                worksheet[datum_cell_ref].comment = comment
+                    try:
+                        new_date_str = datetime.strptime(rv, "%d.%m.%Y").strftime("%d.%m.%Y")
+                    except Exception:
+                        new_date_str = rv
+            new_key = (_norm_ddmmyyyy(new_date_str), round(float(betrag), 2))
+            if new_key in existing_keys:
+                continue
 
-                print(f"   Eintrag für Monat **{ziel_monat_kuerzel}** AKKUMULIERT: Gesamt {new_total_betrag_anzeige} EUR. Details im Kommentar.")
-                eintraege_gefunden += 1
+            # Betrag addieren und Datum setzen
+            worksheet[betrag_cell] = existing_amount + float(betrag)
+            try:
+                worksheet[betrag_cell].number_format = "#,##0.00"
+            except Exception:
+                pass
+            written_date_str = _write_date(date_cell, dval, raw_date)
 
-    # 5. Speichern der geänderten Excel-Datei
-    if eintraege_gefunden > 0:
-        try:
-            workbook.save(excel_pfad)
-            print(f"\n✅ Erfolgreich **{eintraege_gefunden}** Einträge aktualisiert.")
-            print(f"✅ Datei **{os.path.basename(excel_pfad)}** automatisch gespeichert. **Die Formatierung wurde beibehalten.**")
-            
-        except Exception as e:
-            print(f"\nFEHLER beim Speichern der Excel-Datei: {e}")
-            print("Stellen Sie sicher, dass die Datei **nicht** geöffnet ist.")
-    else:
-        print("\nℹ️ Es wurden keine neuen Mieteinträge gefunden oder nur Duplikate ignoriert. Die Excel-Datei wurde nicht geändert.")
+            # Kommentar nur bei „zweitem+“ Eintrag im selben Monat
+            has_previous_in_month = (existing_amount > 0.0) or (len(existing_pairs) > 0)
+            if has_previous_in_month:
+                # Kommentar pflegen: „DD.MM.YYYY [Suchwort]: 123,45 EUR“
+                lines = []
+                if existing_pairs:
+                    for (_, amt, disp, kword) in existing_pairs:
+                        tag = f"{disp}"
+                        if kword:
+                            tag += f" [{kword}]"
+                        lines.append(f"{tag}: {str(f'{amt:.2f}').replace('.', ',')} EUR")
+                else:
+                    # Es gab bereits einen Betrag, aber noch keinen Kommentar → mit bisherigem Datum/Betrag seeden
+                    prev_str = prev_cell_val.strftime("%d.%m.%Y") if hasattr(prev_cell_val, "strftime") else (str(prev_cell_val) if prev_cell_val else "")
+                    if prev_str:
+                        lines.append(f"{prev_str}: {str(f'{existing_amount:.2f}').replace('.', ',')} EUR")
+                tag_new = written_date_str
+                if kw:
+                    tag_new += f" [{kw}]"
+                lines.append(f"{tag_new}: {str(f'{float(betrag):.2f}').replace('.', ',')} EUR")
+                date_cell.comment = Comment("\n".join(lines), "System")
+            else:
+                # Beim ersten Eintrag keinen Kommentar hinterlegen
+                date_cell.comment = None
 
-if __name__ == "__main__":
-    try:
-        fuehre_mietabgleich_durch()
-    except Exception as e:
-        print(f"\nEin kritischer Fehler ist aufgetreten: {e}")
+    # Speichern in results/ Ordner
+    result_path = os.path.join("results", "mieten_abgleich.xlsx")
+    workbook.save(result_path)
+
+    return result_path
