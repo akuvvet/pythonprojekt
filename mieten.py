@@ -172,7 +172,8 @@ def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
                 r"\bstellplatz\b", r"\bgarage\b"
             ]),
             ("Nebenkosten", [
-                r"\bnebenkosten\b", r"\bnk\b", r"\bbetriebskosten\b", r"\bbk\b"
+                r"\bnebenkosten\b", r"\bnk\b", r"\bbetriebskosten\b", r"\bbk\b",
+                r"\bhausgeld\b", r"\bheizkosten\b"
             ]),
             ("Nachzahlung", [
                 r"\bnach\-?zahlung\b", r"\bnachz\b"
@@ -258,21 +259,23 @@ def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
         | payee_norm.str.contains(r"\bbundesagentur\b", regex=True)
         | payee_norm.str.contains(r"\bstadt\s*wuppertal\b", regex=True)
     )
-    # hit_final: bei Behörden kompletter Verwendungszweck, sonst ermitteltes Suchwort (oder Klasse als Fallback)
-    df_konto["__hit_final"] = df_konto[KONTO_VWZ].astype(str)
-    df_konto.loc[~gov_mask, "__hit_final"] = df_konto["__hit"]
-    df_konto["__hit_final"] = df_konto["__hit_final"].where(df_konto["__hit_final"] != "", df_konto["__klass"])
+    # hit_final:
+    # - wenn Suchwort gefunden ODER Behörde → kompletter Verwendungszweck
+    # - sonst Fallback: Klassifizierung
+    df_konto["__hit_final"] = df_konto["__klass"]
+    mask_has_hit = df_konto["__hit"].astype(str) != ""
+    df_konto.loc[(mask_has_hit | gov_mask), "__hit_final"] = df_konto[KONTO_VWZ].astype(str)
 
     # Neues Blatt mit Suchtreffern erstellen: A Datum, B Name, C Suchwort, D Betrag
     sheet_such = "suchtreffer"
     if sheet_such in workbook.sheetnames:
         del workbook[sheet_such]
     ws_such = workbook.create_sheet(sheet_such)
-    ws_such.append(["Datum", "Name", "Suchwort", "Betrag"])
+    ws_such.append(["Datum", "Name", "Suchwort", "Betrag", "Zielmonat"])
 
     relevante_labels = {"Miete", "Nebenkosten", "Nachzahlung", "Rate", "Honorar"}
-    # Alle Einzelbuchungen ohne Aggregation; stabil sortieren für nachvollziehbare Reihenfolge
-    df_such = df_konto[df_konto["__klass"].isin(relevante_labels)].copy()
+    # Alle Einzelbuchungen ohne Aggregation; zusätzlich aufnehmen, wenn ein Monatswort im VWZ erkannt wurde
+    df_such = df_konto[(df_konto["__klass"].isin(relevante_labels)) | (df_konto["__month_override"].notna())].copy()
     try:
         df_such = df_such.sort_values([KONTO_PAYEE, KONTO_DATUM, KONTO_BETRAG], kind="mergesort")
     except Exception:
@@ -280,7 +283,8 @@ def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
 
     for _, r in df_such.iterrows():
         hit = r["__hit_final"]
-        ws_such.append(["", r[KONTO_PAYEE], str(hit), r[KONTO_BETRAG]])
+        ziel_monat = r.get("__month_override", "")
+        ws_such.append(["", r[KONTO_PAYEE], str(hit), r[KONTO_BETRAG], ziel_monat if ziel_monat else ""])
         row_idx = ws_such.max_row
         # Datum korrekt schreiben (immer als echtes Datum DD.MM.YYYY; bei Fehler leer lassen)
         date_cell = ws_such.cell(row=row_idx, column=1)
