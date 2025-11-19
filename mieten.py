@@ -487,8 +487,15 @@ def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
                     except Exception:
                         new_date_str = rv
             new_key = (_norm_ddmmyyyy(new_date_str), round(float(betrag), 2))
+            # 1) Duplikat prüfen gegen vorhandene Kommentar-Paare
             if new_key in existing_keys:
                 continue
+            # 2) Duplikat prüfen gegen erste Einzelbuchung ohne Kommentar
+            if (existing_amount > 0.0) and not existing_pairs:
+                prev_str = prev_cell_val.strftime("%d.%m.%Y") if hasattr(prev_cell_val, "strftime") else (str(prev_cell_val) if prev_cell_val else "")
+                prev_key = (_norm_ddmmyyyy(prev_str), round(existing_amount, 2))
+                if prev_key == new_key:
+                    continue
 
             # Betrag addieren und Datum setzen
             worksheet[betrag_cell] = existing_amount + float(betrag)
