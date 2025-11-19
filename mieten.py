@@ -227,6 +227,22 @@ def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
 
     df_konto["__hit"] = df_konto["__text_summe"].apply(finde_suchwort)
 
+    # Monatsangabe im Verwendungszweck/Kategorie ermitteln (hat Vorrang vor Wertstellung)
+    month_key_map = {k.lower(): v for k, v in MONATS_NAMENS_MAPPING.items()}
+    month_pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in MONATS_NAMENS_MAPPING.keys()) + r")\b", flags=re.IGNORECASE)
+    def finde_monats_override(vwz_text: str) -> str | None:
+        if not vwz_text:
+            return None
+        m = month_pattern.search(vwz_text)
+        if not m:
+            return None
+        return month_key_map.get(m.group(1).lower())
+
+    df_konto["__month_override"] = (
+        (df_konto[KONTO_VWZ].astype(str) + " " + df_konto[KONTO_KATEGORIE].astype(str))
+        .apply(finde_monats_override)
+    )
+
     # Sonderfall: Wenn Zahlender eine Behörde ist (Jobcenter/Agentur/Stadt Wuppertal),
     # soll im Blatt "suchtreffer" in der Spalte "Suchwort" der komplette Verwendungszweck stehen.
     def _normalize_simple(val: str) -> str:
@@ -432,6 +448,10 @@ def fuehre_mietabgleich_durch(excel_pfad, konto_xlsx_pfad):
 
             # Monat robust bestimmen (Timestamp | ISO `YYYY-MM-DD...` | `DD.MM.YYYY`)
             month_idx = None
+            # 0) Vorrang: Monatsangabe aus Verwendungszweck/Kategorie
+            override = t.get("__month_override", None)
+            if isinstance(override, str) and override in months_order:
+                month_idx = months_order.index(override) + 0  # already 0-based via index
             if pd.notna(dval):
                 try:
                     month_idx = int(getattr(dval, "month"))
